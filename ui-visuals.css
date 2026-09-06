@@ -1,0 +1,40 @@
+.agent-identity{display:inline-flex;align-items:center;gap:.4em;max-width:100%;min-width:0;vertical-align:-.25em;color:var(--agent-color,#a4afc2);line-height:1.25}
+.agent-identity__icon{position:relative;display:inline-grid;place-items:center;flex-shrink:0;width:var(--agent-icon-size,20px);height:var(--agent-icon-size,20px);border-radius:30%;overflow:hidden;background:#1b2534;box-shadow:0 0 0 1px rgb(255 255 255 / .06)}
+.agent-identity__icon img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.agent-identity__fallback{font-size:calc(var(--agent-icon-size,20px)*.53);font-weight:700;color:var(--agent-color)}
+.agent-identity__fallback::before{content:attr(data-initial)}
+.agent-identity__name{min-width:0;overflow:hidden;text-overflow:ellipsis;font-weight:600;white-space:nowrap}
+.agent-identity--mention{gap:.3em;vertical-align:-.13em;max-width:100%}
+.agent-identity--mention .agent-identity__name{overflow:visible;white-space:pre-wrap}
+.agent-mentions{white-space:pre-wrap;overflow-wrap:anywhere}
+.app-brand{display:inline-flex;align-items:center;gap:.7rem;min-width:0;vertical-align:middle}
+.app-brand__logo{display:block;flex-shrink:0;width:44px;height:44px;filter:drop-shadow(0 4px 14px rgb(80 133 255 / .14))}
+.app-brand__name{font-size:1.15rem;line-height:1.2;font-weight:650;letter-spacing:-.035em;white-space:nowrap;color:#e6eef8}
+.app-brand--compact .app-brand__logo{width:36px;height:36px}
+.thinking-orb{--orb-size:104px;position:relative;display:inline-grid;place-items:center;isolation:isolate;flex-shrink:0;width:var(--orb-size);height:var(--orb-size);vertical-align:middle;pointer-events:none;perspective:300px}
+.thinking-orb--compact{--orb-size:34px}
+.thinking-orb__halo{position:absolute;inset:9%;border-radius:50%;background:radial-gradient(circle,rgb(107 168 255 / .19),transparent 69%);box-shadow:0 0 30px -16px var(--agent-color);animation:orb-breathe 3.2s ease-in-out infinite}
+.thinking-orb__sphere{position:absolute;inset:22%;border:1px solid rgb(137 199 255 / .32);border-radius:50%;overflow:hidden;background:radial-gradient(circle at 36% 30%,rgb(182 236 255 / .15),transparent 46%),radial-gradient(circle at 61% 75%,rgb(102 158 255 / .22),#0b1528 68%);box-shadow:inset -5px -7px 16px rgb(3 8 18 / .7),inset 2px 2px 9px rgb(137 207 255 / .1),0 0 12px rgb(108 172 255 / .15);animation:orb-luminance 3.2s ease-in-out infinite}
+.thinking-orb__grid{position:absolute;inset:-20%;border-radius:50%;background:repeating-linear-gradient(0deg,transparent 0 8px,rgb(141 206 255 / .13) 8px 9px),repeating-linear-gradient(90deg,transparent 0 8px,rgb(141 206 255 / .1) 8px 9px);transform:rotate(-23deg) scaleX(.85);mask-image:radial-gradient(ellipse,black 10%,transparent 68%);animation:orb-grid 15s linear infinite}
+.thinking-orb__scan{position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 0deg,transparent 0 65%,rgb(153 219 255 / .18) 90%,transparent 100%);animation:orb-spin 4s linear infinite}
+.thinking-orb__core{position:absolute;inset:37%;border-radius:50%;background:#d8f5ff;box-shadow:0 0 9px 2px #89d7ff,0 0 19px 7px var(--agent-color);animation:orb-core 2.4s ease-in-out infinite}
+.thinking-orb__orbit{position:absolute;inset:12%;border:1px solid rgb(133 187 255 / .42);border-radius:50%;box-shadow:0 0 5px rgb(95 165 255 / .06);transform-style:preserve-3d}
+.thinking-orb__orbit--one{border-left-color:var(--agent-color);border-bottom-color:rgb(141 204 255 / .08);animation:orb-orbit-one 9s linear infinite}
+.thinking-orb__orbit--two{inset:8%;border-right-color:var(--agent-color);border-top-color:rgb(141 204 255 / .08);animation:orb-orbit-two 12s linear infinite reverse}
+.thinking-orb__orbit--three{inset:17%;border:1px dashed rgb(156 208 255 / .22);animation:orb-orbit-three 16s linear infinite}
+.thinking-orb__satellite{position:absolute;top:11%;left:11%;width:4px;height:4px;border-radius:50%;background:#bceeff;box-shadow:0 0 7px var(--agent-color)}
+.thinking-orb__tick{position:absolute;top:49%;width:6%;height:2px;background:var(--agent-color);border-radius:2px;opacity:.6}
+.thinking-orb__tick--one{left:0}
+.thinking-orb__tick--two{right:0}
+.thinking-orb--compact .thinking-orb__grid,.thinking-orb--compact .thinking-orb__tick,.thinking-orb--compact .thinking-orb__orbit--three{display:none}
+.thinking-orb--compact .thinking-orb__satellite{width:2px;height:2px}
+.thinking-orb--compact .thinking-orb__core{box-shadow:0 0 4px 1px #89d7ff,0 0 7px 2px var(--agent-color)}
+@keyframes orb-spin{to{transform:rotate(360deg)}}
+@keyframes orb-grid{to{transform:rotate(337deg) scaleX(.85)}}
+@keyframes orb-breathe{0%,100%{opacity:.55;transform:scale(.94)}50%{opacity:1;transform:scale(1.07)}}
+@keyframes orb-luminance{0%,100%{filter:brightness(.94)}50%{filter:brightness(1.2)}}
+@keyframes orb-core{0%,100%{opacity:.68;transform:scale(.82)}50%{opacity:1;transform:scale(1.03)}}
+@keyframes orb-orbit-one{from{transform:rotateZ(-35deg) rotateX(62deg) rotateZ(0)}to{transform:rotateZ(-35deg) rotateX(62deg) rotateZ(360deg)}}
+@keyframes orb-orbit-two{from{transform:rotateZ(42deg) rotateX(66deg) rotateZ(0)}to{transform:rotateZ(42deg) rotateX(66deg) rotateZ(360deg)}}
+@keyframes orb-orbit-three{from{transform:rotateY(53deg) rotateZ(0)}to{transform:rotateY(53deg) rotateZ(360deg)}}
+@media(prefers-reduced-motion:reduce){.thinking-orb *{animation:none!important}.thinking-orb__orbit--one{transform:rotateZ(-35deg) rotateX(62deg)}.thinking-orb__orbit--two{transform:rotateZ(42deg) rotateX(66deg)}.thinking-orb__orbit--three{transform:rotateY(53deg)}.thinking-orb__halo{opacity:.7}}

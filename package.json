@@ -1,0 +1,26 @@
+{
+  "name": "ai-debate",
+  "version": "2.0.0",
+  "description": "Local-first dashboard where AI agents debate, reach consensus, and implement solutions.",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/revoltz-dev/ai-debate.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild app.jsx --bundle --minify --legal-comments=none --outfile=app.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "lucide-react": "0.468.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9"
+  }
+}
