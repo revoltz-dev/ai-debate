@@ -15,15 +15,16 @@ AI Debate coordinates Claude, Codex, Gemini, and custom agents without calling m
 - Run multiple independent debates that continue while you browse other conversations.
 - Connect Claude, Codex, Gemini, or custom terminal agents with individual roles and tokens.
 - Require every participant to confirm attendance before the first AI message.
-- Enforce round-robin turns, round limits, proposals, agreement, and a designated final writer.
-- Send moderator guidance at any time without changing the current phase, turn, or timer.
+- Enforce round-robin turns, proposals, agreement, and a designated final writer without an automatic conversation limit.
+- Send moderator guidance at any time without changing the current phase or workflow status.
 - Route implementation to an AI selected by the agents, a specific AI, a later manual choice, or nobody.
 - Optionally require unanimity before implementation.
-- Optionally require the implementer to report changed files and verification, then ask the other agents to review the result until they approve it or agree on another change.
+- Require the implementer to report changed files and verification, with optional peer review until approval or another agreed change.
+- Let the current implementer publish progress updates, request a directed consultation, or transfer the assignment to another AI.
 - Receive live updates through Server-Sent Events, with second-by-second activity timers and optional audio for new AI messages.
 - Cite agents, earlier messages, and the debate topic with structured `@` references and persistent snapshots.
 - Switch between English and Portuguese automatically or from settings; generated prompts follow the selected language.
-- Autosave topics, titles, roles, round limits, and implementation settings.
+- Autosave topics, titles, roles, and implementation settings.
 
 ![Structured references and live agent activity](docs/images/references.png)
 
@@ -35,7 +36,9 @@ AI Debate coordinates Claude, Codex, Gemini, and custom agents without calling m
 4. Wait for every agent to execute the attendance command included in that prompt.
 5. Follow the live debate while the server controls turns, proposals, and consensus.
 6. Let the selected agent write the final solution and, if enabled, implement it.
-7. With review enabled, the implementer reports what changed and the other agents inspect the result before completion.
+7. The implementer reports what changed. If review is enabled, the other agents inspect the result before completion.
+
+The discussion continues until every participant supports the same proposal or the moderator ends it. The moderator can request a decision at any time; this adds guidance to the conversation without changing its phase or current turn. The displayed round is an activity counter, not a limit.
 
 The app is an orchestrator, not an AI client. Each connected terminal agent uses its own existing model session and sends local HTTP requests described by the generated prompt.
 
@@ -58,7 +61,7 @@ npm run build
 npm start
 ```
 
-Open [http://127.0.0.1:8787](http://127.0.0.1:8787). To use another port:
+Open the private moderator URL printed by the server. Each pairing URL works once; after authorization the server removes it from the address bar and prints a fresh recovery URL in the terminal. The signed moderator session stays in an `HttpOnly` cookie and survives server restarts. To use another port:
 
 ```bash
 node server.js 8790
@@ -72,7 +75,7 @@ Use the copy button beside each participant and paste the prompt into that AI's 
 
 Codex may need local network access enabled for its execution environment. Claude Code may need permission to run the included `curl` requests. Copying the prompt alone does not confirm attendance; each agent must send its own `POST /ready` request.
 
-Once all participants are present, the first AI receives the turn automatically. An AI can send one message per turn, and the server advances to the next participant. The configured round count applies to the entire debate: three agents and five rounds allow up to fifteen AI messages before the final solution.
+Once all participants are present, the first AI receives the turn automatically. An AI can send one message per turn, and the server advances to the next participant. There is no fixed round or message cap, so larger projects can continue until the agents reach consensus or the moderator intervenes.
 
 ## References
 
@@ -95,7 +98,9 @@ The final answer and the implementation are separate phases. The implementation 
 - **Choose a specific AI** routes every eligible result to that participant.
 - **Do not implement automatically** finishes after the written solution.
 
-When post-implementation review is enabled, the assigned AI receives `next: "implement"`, changes the target project, verifies its work, and sends a structured report. The other agents then review the reported files. They can approve the implementation or adopt a new adjustment proposal, which starts another implementation and review cycle.
+While implementing, the assigned AI can send progress updates through `POST /say` under its own identity. With post-implementation review enabled, it can use `?to=AGENT_ID` to request an intermediate consultation; the selected peer replies once while the phase remains `implementation` and the formal report stays pending. The current implementer can also hand the assignment to another participant through `POST /implementation/transfer`; the transfer is recorded in the conversation and gives the recipient a new assignment ID.
+
+After completing the work, the assigned AI always sends a structured report. Without peer review, that report completes the workflow. With review enabled, the other agents inspect the reported files and can approve the implementation or adopt a new adjustment proposal, which starts another implementation and review cycle.
 
 ## Local protocol
 
@@ -112,9 +117,10 @@ POST /say?to=AGENT_ID
 POST /say?pass=1
 POST /say?final=1
 POST /implementation/report
+POST /implementation/transfer
 ```
 
-The server rejects messages from an AI before attendance is complete, messages sent outside that AI's turn, invalid proposal transitions, and stale implementation reports. Repeated identical submissions are idempotent.
+The server rejects messages from an AI before attendance is complete, messages sent outside that AI's turn, invalid proposal transitions, stale implementation actions, and every attempt to use an agent token on a moderator route. Repeated identical submissions are idempotent.
 
 ## Data and privacy
 
@@ -122,9 +128,11 @@ AI Debate binds to `127.0.0.1` and is designed for local use. Do not expose the 
 
 Runtime state is stored under `data/`:
 
-- `data/app.json` contains the moderator key and global settings.
+- `data/app.json` contains global settings and the private key that signs moderator sessions.
 - `data/debates/*.json` contains participant tokens, messages, and debate state.
 - `data/debates/*.md` contains exported final solutions.
+
+The browser receives an `HttpOnly` moderator session. The reusable moderator secret is never exposed to frontend JavaScript or placed in the events URL. Agent tokens authenticate only agent routes.
 
 The entire directory, local logs, screenshots, generated bundles, local validation files, and legacy state files are ignored by Git.
 

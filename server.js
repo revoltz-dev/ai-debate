@@ -17,13 +17,14 @@ const languageOf = value => String(value || '').toLowerCase().startsWith('en') ?
 const implementationModes = ['choose', 'proposal', 'agent', 'none'];
 const normalizeImplementation = d => {
   const value = d.implementation || {}, mode = implementationModes.includes(value.mode) ? value.mode : 'proposal';
+  const configuredAgentId = typeof value.configuredAgentId === 'string' ? value.configuredAgentId : null;
   const hasFinal = d.agreedOn != null && d.final?.writer !== 'human' && Boolean(String(d.final?.text || '').trim());
   const reason = d.state !== 'closed' ? null : mode === 'none' ? 'disabled_by_moderator' : !hasFinal ? 'no_final_solution' : value.unanimousOnly && d.forced ? 'unanimity_required' : null;
   return {
-    mode, agentId: typeof value.agentId === 'string' ? value.agentId : null, unanimousOnly: value.unanimousOnly === true, reviewAfter: value.reviewAfter === true,
+    mode, configuredAgentId, agentId: typeof value.agentId === 'string' ? value.agentId : null, unanimousOnly: value.unanimousOnly === true, reviewAfter: value.reviewAfter === true,
     status: ['waiting', 'pending', 'ready', 'reviewing', 'completed', 'disabled'].includes(value.status) ? value.status : d.state === 'closed' ? reason ? 'disabled' : 'pending' : 'waiting',
     reason: ['disabled_by_moderator', 'no_final_solution', 'unanimity_required', 'agent_unavailable', 'moderator_stop'].includes(value.reason) ? value.reason : reason,
-    assignedAt: value.assignedAt || null, assignmentId: value.assignmentId || null, report: value.report || null, completedAt: value.completedAt || null
+    assignedAt: value.assignedAt || null, assignmentId: value.assignmentId || null, transfer: value.transfer && typeof value.transfer === 'object' ? value.transfer : null, report: value.report || null, completedAt: value.completedAt || null
   };
 };
 
@@ -37,8 +38,8 @@ const newId = () => { const d = new Date();
 const titleNow = language => { const d = new Date(); return `${language === 'en' ? 'Debate' : 'Debate de'} ${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 const okId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id);
 const normalize = d => { const implementation = normalizeImplementation(d);
-  const fields = Object.fromEntries(['id', 'title', 'topic', 'maxRounds', 'createdAt', 'updatedAt', 'state', 'turn', 'writer', 'forced', 'agreedOn', 'final'].filter(key => Object.hasOwn(d, key)).map(key => [key, d[key]]));
-  return ({ ...fresh(), title: '', topic: '', maxRounds: 6, createdAt: iso(), updatedAt: iso(), ...fields, language: languageOf(d.language),
+  const fields = Object.fromEntries(['id', 'title', 'topic', 'createdAt', 'updatedAt', 'state', 'turn', 'writer', 'forced', 'agreedOn', 'final'].filter(key => Object.hasOwn(d, key)).map(key => [key, d[key]]));
+  return ({ ...fresh(), title: '', topic: '', createdAt: iso(), updatedAt: iso(), ...fields, language: languageOf(d.language),
   implementation, phase: ['debate', 'implementation', 'review', 'finished'].includes(d.phase) ? d.phase : d.state === 'closed' ? ['pending', 'ready'].includes(implementation.status) ? 'implementation' : 'finished' : 'debate',
   phaseStartId: Number.isInteger(d.phaseStartId) && d.phaseStartId > 0 ? d.phaseStartId : 1, reviewCycle: Number.isInteger(d.reviewCycle) && d.reviewCycle >= 0 ? d.reviewCycle : 0,
   turnStartedAt: d.turnStartedAt || (Array.isArray(d.messages) ? d.messages : []).findLast(m => m.from !== 'human')?.ts || d.createdAt || iso(),
@@ -48,16 +49,29 @@ const debateIds = () => { try { return fs.readdirSync(DEBS).filter(f => f.endsWi
 const loadDebate = id => { if (!okId(id)) return null;
   try { const d = JSON.parse(fs.readFileSync(debFile(id), 'utf8')); return d && typeof d === 'object' ? normalize({ ...d, id }) : null; } catch { return null; } };
 
-let APP, S;
+let APP, S, moderatorBootstrap = rnd(24);
 let waiters = [];
 const debates = new Map(), subscribers = new Set(), pendingWrites = new Map();
+const MODERATOR_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
+const cookieValue = (req, name) => String(req.headers.cookie || '').split(';').map(part => part.trim().split('=')).find(([key]) => key === name)?.slice(1).join('=') || null;
+const safeEqual = (left, right) => { const a = Buffer.from(String(left)), b = Buffer.from(String(right)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
+const moderatorSignature = expires => crypto.createHmac('sha256', APP.moderatorSecret).update(`moderator-session:${expires}`).digest('hex');
+const rotateModeratorBootstrap = () => { moderatorBootstrap = rnd(24); console.log(`Novo acesso do moderador: ${URL_}/?pair=${moderatorBootstrap}`); };
+const issueModeratorSession = res => { const expires = (Date.now() + MODERATOR_SESSION_MS).toString(36), value = `${expires}.${moderatorSignature(expires)}`; res.setHeader('Set-Cookie', `ai_debate_moderator=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(MODERATOR_SESSION_MS / 1000)}`); };
+const hasModeratorSession = req => {
+  if (req.headers['x-token']) return false;
+  const value = cookieValue(req, 'ai_debate_moderator'), match = /^([a-z0-9]+)\.([a-f0-9]{64})$/.exec(value || '');
+  if (!match || parseInt(match[1], 36) <= Date.now() || !safeEqual(match[2], moderatorSignature(match[1]))) return false;
+  if (!['GET', 'HEAD'].includes(req.method)) { try { if (new URL(String(req.headers.origin || '')).host !== req.headers.host) return false; } catch { return false; } }
+  return true;
+};
 
 let dirty = false;
 const writeJson = (file, obj) => { const json = JSON.stringify(obj, null, 1);
   try { fs.mkdirSync(DEBS, { recursive: true }); fs.writeFileSync(file + '.tmp', json); fs.renameSync(file + '.tmp', file); return true; }
   catch (e1) { try { fs.writeFileSync(file, json); return true; } catch (e2) { console.error(`${path.basename(file)} nao gravado, tento de novo em 3 s:`, e2.code || e2.message); return false; } } };
 const writeDebate = d => { d.updatedAt = iso(); return writeJson(debFile(d.id), d); };
-const saveApp = () => writeJson(path.join(DATA, 'app.json'), { admin: APP.admin, waitSeconds: APP.waitSeconds, activeId: APP.activeId, languagePreference: APP.languagePreference, language: APP.language });
+const saveApp = () => writeJson(path.join(DATA, 'app.json'), { moderatorSecret: APP.moderatorSecret, waitSeconds: APP.waitSeconds, activeId: APP.activeId, languagePreference: APP.languagePreference, language: APP.language });
 const save = () => { debates.set(S.id, S); const a = saveApp(), b = writeDebate(S); if (b) pendingWrites.delete(S.id); else pendingWrites.set(S.id, S); dirty = !a || pendingWrites.size > 0; };
 setInterval(() => { if (!dirty) return; const a = saveApp(); for (const [id, d] of pendingWrites) if (writeDebate(d)) pendingWrites.delete(id); dirty = !a || pendingWrites.size > 0; }, 3000).unref();
 
@@ -65,7 +79,7 @@ setInterval(() => { if (!dirty) return; const a = saveApp(); for (const [id, d] 
   try { fs.mkdirSync(DEBS, { recursive: true }); } catch {}
   try { APP = JSON.parse(fs.readFileSync(path.join(DATA, 'app.json'), 'utf8')) || {}; } catch { APP = {}; }
   if (typeof APP !== 'object' || Array.isArray(APP)) APP = {};
-  APP.admin = APP.admin || rnd(8);
+  APP.moderatorSecret = /^[a-f0-9]{64}$/.test(APP.moderatorSecret || '') ? APP.moderatorSecret : rnd(32);
   APP.waitSeconds = +APP.waitSeconds >= 5 ? +APP.waitSeconds : 50;
   APP.languagePreference = ['system', 'pt', 'en'].includes(APP.languagePreference) ? APP.languagePreference : 'system';
   APP.language = languageOf(APP.language);
@@ -98,10 +112,9 @@ const waitingMessage = () => {
   ].filter(Boolean).join(' ');
 };
 const phaseMessages = () => S.messages.filter(m => m.id >= S.phaseStartId);
-const phaseAgentMsgs = () => phaseMessages().filter(m => m.from !== 'human' && m.from !== 'system' && m.kind !== 'implementation_report');
+const phaseAgentMsgs = () => phaseMessages().filter(m => m.from !== 'human' && m.from !== 'system' && !['implementation_report', 'implementation_update', 'implementation_reply', 'implementation_transfer'].includes(m.kind));
 const count = () => phaseAgentMsgs().length;
-const maxMessages = () => S.maxRounds * N();
-const round = () => N() ? Math.min(Math.floor(count() / N()) + 1, S.maxRounds) : 1;
+const round = () => N() ? Math.floor(count() / N()) + 1 : 1;
 const nextAfter = id => { const i = S.agents.findIndex(a => a.id === id); return S.agents[(i + 1) % N()].id; };
 const resumeAfter = (asker, answered) => { const r = nextAfter(asker); return r === answered ? nextAfter(answered) : r; };
 const turn = () => S.state === 'closed' || presence().waiting ? null : S.state === 'agreed' ? S.writer : N() < 2 ? null
@@ -123,11 +136,27 @@ const activityOf = id => {
 };
 const positions = () => { const pos = {}; for (const m of phaseMessages()) { if (m.kind === 'propose') pos[m.from] = m.id; else if (m.kind === 'agree') pos[m.from] = m.agree; } return pos; };
 const lastOwn = me => { const m = S.messages.findLast(x => x.from === me); return m ? m.id : 0; };
-const next = me => S.state === 'closed' ? S.implementation.status === 'pending' ? 'GET /wait' : S.implementation.status === 'ready' ? S.implementation.agentId === me ? 'implement' : S.implementation.reviewAfter ? 'GET /wait' : 'stop' : 'stop' : presence().waiting && !agent(me)?.confirmedAt ? 'POST /ready' : turn() !== me ? 'GET /wait'
+const implementationMessages = () => S.implementation.assignmentId ? S.messages.filter(m => m.implementationAssignmentId === S.implementation.assignmentId) : [];
+const pendingImplementationMessageFor = me => {
+  const messages = implementationMessages(), directed = messages.findLast(m => m.to === me && m.from !== me && ['hint', 'implementation_update'].includes(m.kind));
+  if (!directed) return null;
+  const resolved = messages.findLast(m => m.id > directed.id && ((m.from === me && ['implementation_update', 'implementation_reply'].includes(m.kind)) || m.skippedConsultations?.includes(me)));
+  return resolved ? null : directed;
+};
+const pendingImplementationPeers = () => {
+  const implementer = S.implementation.agentId;
+  return S.agents.filter(a => a.id !== implementer && pendingImplementationMessageFor(a.id));
+};
+const implementationConversation = me => {
+  const pending = pendingImplementationMessageFor(me), waitingFor = pendingImplementationPeers();
+  return { canSend: Boolean(pending || (me === S.implementation.agentId && waitingFor.length === 0)), replyTo: pending ? { id: pending.id, from: pending.from, name: nameOf(pending.from) } : null, waitingFor: waitingFor.map(a => ({ id: a.id, name: a.name })) };
+};
+const implementationPublic = () => ({ ...S.implementation, consultation: { pending: S.agents.filter(a => pendingImplementationMessageFor(a.id)).map(a => ({ id: a.id, name: a.name })), waitingFor: pendingImplementationPeers().map(a => ({ id: a.id, name: a.name })) } });
+const next = me => S.state === 'closed' ? S.implementation.status === 'pending' ? 'GET /wait' : S.implementation.status === 'ready' ? pendingImplementationMessageFor(me) ? 'POST /say' : S.implementation.agentId === me ? pendingImplementationPeers().length ? 'GET /wait' : 'implement' : 'GET /wait' : 'stop' : presence().waiting && !agent(me)?.confirmedAt ? 'POST /ready' : turn() !== me ? 'GET /wait'
   : S.state === 'agreed' ? 'POST /say?final=1' : count() === 0 ? 'POST /say?propose=AGENT_ID' : 'POST /say';
-const implementationView = me => ({ ...S.implementation, ...(next(me) === 'implement' ? { text: S.final.text, proposal: S.agreedOn, reportEndpoint: 'POST /implementation/report' } : {}) });
+const implementationView = me => ({ ...S.implementation, consultation: implementationConversation(me), ...(next(me) === 'implement' ? { text: S.final.text, proposal: S.agreedOn, reportEndpoint: 'POST /implementation/report', transferEndpoint: 'POST /implementation/transfer' } : {}) });
 const publicProposal = p => p && { id: p.id, from: p.from, writer: p.writer, reviewCompletion: p.reviewCompletion === true };
-const pub = m => ({ id: m.id, ts: m.ts, from: m.from, name: nameOf(m.from), kind: m.kind, to: m.to, writer: m.writer, agree: m.agree, text: m.text, references: m.references || [], ...(m.reviewCompletion ? { reviewCompletion: true } : {}), ...(m.implementationReport ? { implementationReport: m.implementationReport } : {}) });
+const pub = m => ({ id: m.id, ts: m.ts, from: m.from, name: nameOf(m.from), kind: m.kind, to: m.to, writer: m.writer, agree: m.agree, replyTo: m.replyTo, text: m.text, references: m.references || [], ...(m.reviewCompletion ? { reviewCompletion: true } : {}), ...(m.implementationReport ? { implementationReport: m.implementationReport } : {}), ...(m.implementationTransfer ? { implementationTransfer: m.implementationTransfer } : {}) });
 const referencesFor = (input, text) => {
   const invalid = (pt, en) => ({ error: 'invalid_references', message: localized(pt, en) });
   if (input === undefined) return { references: [] };
@@ -160,22 +189,24 @@ const referencesFor = (input, text) => {
   return { references };
 };
 const view = me => {
-  const p = adopted(), first = lastOwn(me) === 0;
-  return { debateId: S.id, language: S.language, state: S.state, phase: S.phase, phaseStartId: S.phaseStartId, reviewCycle: S.reviewCycle, presence: presence(), waitingFor: waitingFor(), you: me, turn: turn(), yourTurn: turn() === me, round: round(), maxRounds: S.maxRounds, count: count(), totalCount: agentMsgs().length, maxMessages: maxMessages(),
+  const p = adopted(), first = lastOwn(me) === 0, action = next(me);
+  return { debateId: S.id, language: S.language, state: S.state, phase: S.phase, phaseStartId: S.phaseStartId, reviewCycle: S.reviewCycle, presence: presence(), waitingFor: waitingFor(), you: me, turn: turn(), yourTurn: turn() === me || (S.phase === 'implementation' && implementationConversation(me).canSend), round: round(), count: count(), totalCount: agentMsgs().length,
     proposal: publicProposal(p), agreedOn: S.agreedOn, positions: positions(), writer: S.writer, forced: S.forced,
     implementation: implementationView(me),
-    instruction: presence().waiting ? `${waitingMessage()} ${next(me) === 'POST /ready' ? localized('Envie esse comando obrigatório com seu próprio token para liberar o chat. Copiar o prompt não libera o chat. O moderador pode enviar mensagens; elas não liberam a participação das IAs.', 'Send this mandatory command using your own token to unlock the chat. Copying the prompt does not unlock it. The moderator may send messages; they do not release AI participation.') : localized('Sua liberação já foi confirmada. Continue com GET /wait.', 'Your release is already confirmed. Continue with GET /wait.')}` : next(me) === 'implement'
-      ? localized(`Implemente implementation.text e valide a mudança. Só você está autorizado. ${S.implementation.reviewAfter ? 'Depois envie POST /implementation/report com JSON {assignmentId,summary,files:[caminhos],verification,reviewRequest}, usando implementation.assignmentId e descrevendo o que mudou, onde, como verificou e pedindo opiniões. Volte a /wait para a revisão; não encerre ainda.' : 'Informe o resultado e conclua; o relatório em POST /implementation/report é opcional.'}`, `Implement implementation.text and validate the change. Only you are authorized. ${S.implementation.reviewAfter ? 'Then POST /implementation/report with JSON {assignmentId,summary,files:[paths],verification,reviewRequest}, using implementation.assignmentId and describing changes, locations, checks, and asking peers for opinions. Return to /wait for review; do not stop yet.' : 'Report the result and finish; POST /implementation/report is optional.'}`)
+    instruction: presence().waiting ? `${waitingMessage()} ${action === 'POST /ready' ? localized('Envie esse comando obrigatório com seu próprio token para liberar o chat. Copiar o prompt não libera o chat. O moderador pode enviar mensagens; elas não liberam a participação das IAs.', 'Send this mandatory command using your own token to unlock the chat. Copying the prompt does not unlock it. The moderator may send messages; they do not release AI participation.') : localized('Sua liberação já foi confirmada. Continue com GET /wait.', 'Your release is already confirmed. Continue with GET /wait.')}` : action === 'implement'
+      ? localized(`Implemente implementation.text e valide a mudança. Só você está autorizado. Se outra IA for mais adequada, transfira com POST /implementation/transfer. Ao terminar, envie POST /implementation/report com JSON {assignmentId,summary,files:[caminhos],verification${S.implementation.reviewAfter ? ',reviewRequest' : ''}}. ${S.implementation.reviewAfter ? 'Peça opiniões em reviewRequest e volte a /wait para a revisão.' : 'O relatório conclui o fluxo.'}`, `Implement implementation.text and validate the change. Only you are authorized. If another AI is better suited, transfer with POST /implementation/transfer. When finished, POST /implementation/report with JSON {assignmentId,summary,files:[paths],verification${S.implementation.reviewAfter ? ',reviewRequest' : ''}}. ${S.implementation.reviewAfter ? 'Ask for opinions in reviewRequest and return to /wait for review.' : 'The report completes the workflow.'}`)
+      : S.phase === 'implementation' && action === 'POST /say' ? localized('Responda à consulta intermediária com uma mensagem comum em POST /say, sem flags. A implementação e a revisão formal permanecem no estado atual.', 'Reply to the intermediate consultation with a plain POST /say message and no flags. Implementation and formal review remain in their current state.')
+      : S.phase === 'implementation' && S.implementation.agentId === me && implementationConversation(me).waitingFor.length ? localized(`Aguarde ${new Intl.ListFormat('pt-BR', { style: 'long', type: 'conjunction' }).format(implementationConversation(me).waitingFor.map(a => a.name))} responder à consulta intermediária com GET /wait. Depois continue a implementação.`, `Wait for ${new Intl.ListFormat('en', { style: 'long', type: 'conjunction' }).format(implementationConversation(me).waitingFor.map(a => a.name))} to answer the intermediate consultation with GET /wait. Then continue implementation.`)
       : S.phase === 'review' ? localized('Revise os arquivos e testes do relatório. A proposta reviewCompletion:true aprova a implementação e encerra após o texto final; ?propose=ID propõe novas mudanças. Siga next e não edite até next:"implement".', 'Review the reported files and tests. A reviewCompletion:true proposal approves the implementation and finishes after the final text; ?propose=ID proposes new changes. Follow next and do not edit before next:"implement".')
       : localized('Responda em português. Siga next: GET /wait continua mesmo em state:"closed". Não implemente sem next:"implement"; com next:"stop", pare.', 'Respond in English. Follow next: GET /wait continues even in state:"closed". Do not implement without next:"implement"; stop only at next:"stop".'),
     ...(first ? { topic: S.topic, agents: S.agents.map(a => ({ id: a.id, name: a.name, role: a.role, confirmedAt: a.confirmedAt })) } : {}),
-    messages: S.messages.filter(m => m.id > lastOwn(me)).map(pub), next: next(me) };
+    messages: S.messages.filter(m => m.id > lastOwn(me)).map(pub), next: action };
 };
 const publicState = () => ({ id: S.id, title: S.title, activeId: APP.activeId, createdAt: S.createdAt, updatedAt: S.updatedAt,
   language: S.language, languagePreference: APP.languagePreference, appLanguage: APP.language, turnStartedAt: turn() ? S.turnStartedAt : null, presence: presence(), waitingFor: waitingFor(),
-  state: S.state, phase: S.phase, phaseStartId: S.phaseStartId, reviewCycle: S.reviewCycle, turn: turn(), round: round(), maxRounds: S.maxRounds, waitSeconds: APP.waitSeconds, count: count(), totalCount: agentMsgs().length, maxMessages: maxMessages(),
+  state: S.state, phase: S.phase, phaseStartId: S.phaseStartId, reviewCycle: S.reviewCycle, turn: turn(), round: round(), waitSeconds: APP.waitSeconds, count: count(), totalCount: agentMsgs().length,
   writer: S.writer, forced: S.forced, agreedOn: S.agreedOn, topic: S.topic, url: URL_, proposal: publicProposal(proposal()),
-  positions: positions(), agents: S.agents.map(a => ({ id: a.id, name: a.name, kind: a.kind, role: a.role, color: a.color, confirmedAt: a.confirmedAt, activity: activityOf(a.id) })), messages: S.messages.map(pub), final: S.final, implementation: { ...S.implementation },
+  positions: positions(), agents: S.agents.map(a => ({ id: a.id, name: a.name, kind: a.kind, role: a.role, color: a.color, confirmedAt: a.confirmedAt, activity: activityOf(a.id) })), messages: S.messages.map(pub), final: S.final, implementation: implementationPublic(),
   lastTs: (S.messages.at(-1) || {}).ts || null });
 
 const ascii = s => s.replace(/[\u0080-\uffff]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
@@ -191,18 +222,18 @@ const englishHints = {
   first_message_must_propose: 'Use ?propose=AGENT_ID for the chosen implementer.',
   bad_propose: 'Use ?propose=AGENT_ID for the chosen implementer.',
   no_chained_direct: 'Answer the directed question without ?to to resume the normal order.',
-  no_direct_on_last_message: 'This is the final message: argue, ?agree=N, or ?pass=1.',
-  last_round_no_propose: 'In the final round, argue, ?agree=N, or ?pass=1.',
+  implementation_plain_message_only: 'During implementation, send only a plain update or consultation. Submit the completed work through POST /implementation/report.',
+  implementation_message_not_available: 'Follow next. Only the implementer or an agent answering a directed consultation may speak during implementation.',
+  implementation_consultation_pending: 'Wait for the requested peer response with GET /wait before continuing implementation.',
+  implementation_consultation_disabled: 'Enable post-implementation review to keep peers available for intermediate consultation.',
+  implementation_action_pending: 'Complete or transfer the pending consultation before submitting the implementation report.',
   too_early_to_agree: 'Challenge the proposal with evidence in round 1; agreement begins in round 2.',
   bad_agree: 'Agree only with latestProposal; propose an older solution again to revisit it.',
   own_proposal: 'You cannot agree with your own proposal; argue or wait for others.',
   all_passed: 'All other agents passed; agree with the current proposal or propose again.',
-  bad_admin: `Reload the panel at ${URL_} to receive its administration key.`,
+  bad_admin: `Reload the panel at ${URL_} to renew the moderator session.`,
   title_required: 'Enter a debate title.',
   debate_started: 'Create a new debate before changing its participants.',
-  maxRounds_2_50: 'Choose between 2 and 50 rounds.',
-  maxRounds_below_current_round: 'The debate has already reached a later round; use Force decision to finish.',
-  no_proposal: 'There is no proposal to adopt yet.',
   panel_missing: 'panel.html must be beside server.js.'
 };
 const send = (res, code, obj) => { if (res.writableEnded) return; if (S.language === 'en' && obj?.hint) obj = { ...obj, hint: obj.duplicate ? 'Your identical previous message was accepted; read messages and respond to what followed.' : englishHints[obj.error] || obj.hint }; res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(ascii(JSON.stringify(obj)) + '\n'); };
@@ -221,27 +252,17 @@ const activate = d => { save(); S = d; APP.activeId = S.id; debates.set(S.id, S)
 const withDebate = (d, fn) => { const prev = S; S = d; try { return fn(); } finally { S = prev; } };
 const publicStateOf = d => withDebate(d, publicState);
 const summaryOf = d => withDebate(d, () => ({ id: d.id, title: d.title, topic: d.topic, state: d.state, phase: d.phase, phaseStartId: d.phaseStartId, reviewCycle: d.reviewCycle, createdAt: d.createdAt, updatedAt: d.updatedAt,
-  language: d.language, presence: presence(), waitingFor: waitingFor(), turn: turn(), turnStartedAt: turn() ? d.turnStartedAt : null, lastMessageId: d.messages.at(-1)?.id || 0, lastAgentMessageId: agentMsgs().at(-1)?.id || 0, maxRounds: d.maxRounds, count: count(), totalCount: agentMsgs().length, agents: d.agents.map(a => ({ id: a.id, name: a.name, kind: a.kind, color: a.color, confirmedAt: a.confirmedAt, activity: activityOf(a.id) })),
-  final: d.final ? { writer: d.final.writer, proposal: d.final.proposal, forced: d.final.forced } : null, implementation: { ...d.implementation }, active: d.id === APP.activeId }));
+  language: d.language, presence: presence(), waitingFor: waitingFor(), turn: turn(), turnStartedAt: turn() ? d.turnStartedAt : null, lastMessageId: d.messages.at(-1)?.id || 0, lastAgentMessageId: agentMsgs().at(-1)?.id || 0, round: round(), count: count(), totalCount: agentMsgs().length, agents: d.agents.map(a => ({ id: a.id, name: a.name, kind: a.kind, color: a.color, confirmedAt: a.confirmedAt, activity: activityOf(a.id) })),
+  final: d.final ? { writer: d.final.writer, proposal: d.final.proposal, forced: d.final.forced } : null, implementation: implementationPublic(), active: d.id === APP.activeId }));
 const allDebates = () => { for (const id of debateIds()) getDebate(id); return [...debates.values()]; };
 const listDebates = () => allDebates().sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(b.id).localeCompare(String(a.id))).map(summaryOf);
 const debateForToken = tok => typeof tok === 'string' ? allDebates().find(d => d.agents.some(a => a.token === tok)) || null : null;
 
-const decide = reason => {
-  const pos = positions(), ps = proposals(); if (!ps.length) return false;
-  const score = id => Object.values(pos).filter(v => v === id).length;
-  const best = ps.reduce((b, p) => score(p.id) >= score(b.id) ? p : b, ps[0]);
-  const backers = S.agents.filter(a => pos[a.id] === best.id).map(a => a.id);
-  const writer = backers.includes(best.from) ? best.from : backers.includes(best.writer) ? best.writer : backers.at(-1) || best.from;
-  S.state = 'agreed'; S.writer = writer; S.forced = true; S.agreedOn = best.id; S.turn = writer;
-  push('system', 'system', localized(`Sem acordo unânime (${reason}). Proposta #${best.id} de ${nameOf(best.from)} adotada; ${nameOf(writer)} escreve a solução final.`, `No unanimous agreement (${reason}). Proposal #${best.id} by ${nameOf(best.from)} adopted; ${nameOf(writer)} writes the final solution.`));
-  return true;
-};
 const hasFinalSolution = () => S.state === 'closed' && S.agreedOn != null && S.final?.writer !== 'human' && !S.final?.reviewCompletion && Boolean(S.final?.text?.trim());
 const resolveImplementation = () => {
   const configuration = S.implementation;
   if (S.phase === 'review' && S.state !== 'closed') { configuration.status = 'reviewing'; configuration.reason = null; return; }
-  configuration.status = 'waiting'; configuration.reason = null; configuration.assignedAt = null; configuration.assignmentId = null; configuration.report = null; configuration.completedAt = null;
+  configuration.status = 'waiting'; configuration.reason = null; configuration.assignedAt = null; configuration.assignmentId = null; configuration.transfer = null; configuration.report = null; configuration.completedAt = null;
   if (S.state !== 'closed') return;
   S.phase = 'implementation';
   if (configuration.mode === 'none' || !hasFinalSolution() || (configuration.unanimousOnly && S.forced)) {
@@ -251,9 +272,9 @@ const resolveImplementation = () => {
     return;
   }
   if (configuration.mode === 'choose') { configuration.agentId = null; configuration.status = 'pending'; return; }
-  const selected = configuration.mode === 'proposal' ? adopted()?.writer : configuration.agentId;
+  const selected = configuration.mode === 'proposal' ? adopted()?.writer : configuration.configuredAgentId;
   if (!agent(selected)) { configuration.status = 'pending'; configuration.reason = 'agent_unavailable'; configuration.agentId = null; return; }
-  configuration.agentId = selected; configuration.status = 'ready'; configuration.assignedAt = iso(); configuration.assignmentId = rnd(12);
+  configuration.agentId = selected; configuration.status = 'ready'; configuration.assignedAt = iso(); configuration.assignmentId = rnd(12); configuration.transfer = null;
 };
 const close = (writerId, text, ts) => {
   const reviewCompletion = writerId !== 'human' && S.phase === 'review' && adopted()?.reviewCompletion === true;
@@ -274,6 +295,7 @@ function promptFor(a) {
   const ready = `curl.exe -sS -X POST "${u}/ready" -H "X-Token: ${token}"`;
   const say = `curl.exe -sS "${u}/say?FLAG" -H "X-Token: ${token}" --data-binary "@${file}"`;
   const report = `curl.exe -sS "${u}/implementation/report" -H "X-Token: ${token}" -H "Content-Type: application/json" --data-binary "@.ai-debate/${a.id}-implementation.json"`;
+  const transfer = `curl.exe -sS "${u}/implementation/transfer" -H "X-Token: ${token}" -H "Content-Type: application/json" --data-binary "@.ai-debate/${a.id}-transfer.json"`;
   return (S.language === 'en' ? [
     `You are ${a.name} (${a.id}) in technical debate ${S.id}. Respond in English. Role: ${a.role}`,
     `Peers: ${others || 'none yet'}. Goal: agree on one evidence-based solution.`,
@@ -284,15 +306,16 @@ function promptFor(a) {
     `Send: ${say}`,
     `Write UTF-8 without BOM to ${file} using your file-writing tool, overwriting each time. Never put message text inline in shell commands or use echo/Set-Content/Out-File.`,
     `Replace FLAG with one option: propose=ID (implementer: ${ids().join(', ')}), agree=N (latest proposal message ID), to=ID (direct question), pass=1, final=1; remove ?FLAG for an ordinary reply.`,
-    `Loop by next: call /wait until next:"stop" or next:"implement", including while state:"closed" and implementation is pending. Send only when yourTurn:true. Inspect code and run tests as needed; your turn does not expire. After each POST follow next. If timeout:true or the shell times out, repeat /wait.`,
+    `Loop by next and follow the returned action exactly. Send only when yourTurn:true. GET /wait continues across closed states and directed consultations. A timeout means call /wait again.`,
     `The first message must propose. No agreement in round 1: challenge with evidence first. Every substantive message cites file:line or a test command and result. Proposals state root cause, exact change, and verification.`,
-    `Agreement requires ?agree=N, never your own proposal; writing "I agree" alone does not count. In the last round, argue, agree, or pass. After a directed question, reply without ?to.`,
-    `Handle error as instructions: not_your_turn -> /wait; bad_agree -> latestProposal; too_early_to_agree or last_round_no_propose -> argue; need_final -> final=1. duplicate:true means the previous message was already accepted.`,
+    `Agreement requires ?agree=N, never your own proposal; writing "I agree" alone does not count. After a directed question, reply without ?to. There is no automatic round or message limit: continue until consensus or moderator action.`,
+    `Handle error as instructions: not_your_turn -> /wait; bad_agree -> latestProposal; too_early_to_agree -> challenge with evidence; need_final -> final=1. duplicate:true means the previous message was already accepted.`,
     `In state:"agreed", proposal is the adopted proposal. Only writer sends ?final=1 immediately with the agreed solution and no new changes. Writing the final does not authorize implementation. All agents continue /wait while next says so, even after closed.`,
     `Never edit project code before next:"implement". Only that designated agent implements implementation.text and verifies the result. The AIs nominate this agent in the adopted proposal unless the moderator overrides. With next:"stop", end without further edits.`,
-    `If implementation.reviewAfter:true, the implementer MUST return after editing: write a UTF-8 JSON report with {"assignmentId":"<implementation.assignmentId>","summary":"what changed","files":["changed file paths"],"verification":"commands and results","reviewRequest":"ask peers to review"}. All fields are required. Submit: ${report}. Then follow next and keep /wait; do not stop after implementation. With reviewAfter:false, reporting is optional and you may finish.`,
-    `Reports start phase:"review" with fresh rounds and votes while preserving history. Inspect the changed files and tests. A proposal marked reviewCompletion:true approves the implementation; agree with it to finish after the final text. To request more changes, send ?propose=ID with the concrete new plan. Only an adopted change plan starts another implementation and report cycle. maxRounds bounds each debate/review phase.`,
-    `Respect moderator messages (from:"human") and response language. The moderator may send messages in any phase; they do not change next or authorize skipping gates. Leaving the browser never ends the debate or implementation selection. Do not ask the human to continue while next says /wait. If the very first connection fails, report the unavailable server in one line; otherwise retry /wait.`
+    `While next:"implement", the implementer may send plain /say progress updates. Use ?to=ID for one intermediate peer consultation and wait while next is GET /wait. To hand the work to a better-suited peer, write UTF-8 JSON {"assignmentId":"<implementation.assignmentId>","to":"AGENT_ID","reason":"completed work, files, checks, pending work, and why this peer"} and submit ${transfer}. Only the current implementer can transfer; stop editing after success. The recipient becomes the implementer immediately and must use the new assignmentId.`,
+    `The implementer MUST return after editing. Write UTF-8 JSON with {"assignmentId":"<implementation.assignmentId>","summary":"what changed","files":["changed file paths"],"verification":"commands and results"${S.implementation.reviewAfter ? ',"reviewRequest":"ask peers to review"' : ''}} and submit ${report}. ${S.implementation.reviewAfter ? 'Then follow next and keep /wait for review.' : 'The accepted report completes the workflow.'}`,
+    `Reports start phase:"review" with fresh discussion and votes while preserving history. Inspect the changed files and tests. A proposal marked reviewCompletion:true approves the implementation; agree with it to finish after the final text. To request more changes, send ?propose=ID with the concrete new plan. Only an adopted change plan starts another implementation and report cycle.`,
+    `Respect moderator messages (from:"human") and follow next when one requests a reply. Only the human moderator uses /admin/*; never access the dashboard session, call moderator routes, or post as human. Your X-Token is valid only on agent routes. Leaving the browser never ends the workflow. If the first connection fails, report it once; otherwise retry /wait.`
   ] : [
     `Você é ${a.name} (${a.id}) no debate técnico ${S.id}. Responda em português. Papel: ${a.role}`,
     `Participantes: ${others || 'nenhum ainda'}. Objetivo: acordar uma solução com evidências.`,
@@ -303,15 +326,16 @@ function promptFor(a) {
     `Envie: ${say}`,
     `Escreva UTF-8 sem BOM em ${file} com sua ferramenta de escrita de arquivos, sobrescrevendo a cada mensagem. Nunca use texto inline no shell ou echo/Set-Content/Out-File.`,
     `Troque FLAG por uma opção: propose=ID (implementador: ${ids().join(', ')}), agree=N (ID da proposta mais recente), to=ID (pergunta dirigida), pass=1, final=1; remova ?FLAG para uma resposta comum.`,
-    `Siga next: chame /wait até next:"stop" ou next:"implement", inclusive em state:"closed" se a escolha do implementador estiver pendente. Envie somente com yourTurn:true. Leia código e rode testes; a vez não expira. Após cada POST, siga next. Com timeout:true ou comando interrompido por timeout, repita /wait.`,
+    `Siga next e execute exatamente a ação retornada. Envie somente com yourTurn:true. GET /wait continua em estados fechados e consultas dirigidas. Timeout significa chamar /wait novamente.`,
     `A primeira mensagem deve propor. Na rodada 1, refute com evidências antes de concordar. Toda mensagem relevante cita arquivo:linha ou comando de teste e resultado. Propostas trazem causa raiz, mudança exata e verificação.`,
-    `Concordância exige ?agree=N, nunca na sua proposta; escrever "concordo" não basta. Na última rodada, argumente, concorde ou passe. Após pergunta dirigida, responda sem ?to.`,
-    `Trate error como instrução: not_your_turn -> /wait; bad_agree -> latestProposal; too_early_to_agree ou last_round_no_propose -> argumente; need_final -> final=1. duplicate:true indica que a mensagem já foi aceita.`,
+    `Concordância exige ?agree=N, nunca na sua proposta; escrever "concordo" não basta. Após pergunta dirigida, responda sem ?to. Não há limite automático de rodadas ou mensagens: continue até o consenso ou uma ação do moderador.`,
+    `Trate error como instrução: not_your_turn -> /wait; bad_agree -> latestProposal; too_early_to_agree -> conteste com evidências; need_final -> final=1. duplicate:true indica que a mensagem já foi aceita.`,
     `Em state:"agreed", proposal é a proposta adotada. Só o writer envia ?final=1 imediatamente com a solução acordada, sem novidades. Escrever o texto final não autoriza implementar. Todos seguem /wait enquanto next indicar, mesmo após closed.`,
     `Nunca edite o projeto antes de next:"implement". Só o agente designado implementa implementation.text e verifica o resultado. As IAs indicam esse agente na proposta adotada, salvo escolha do moderador. Com next:"stop", encerre sem novas edições.`,
-    `Com implementation.reviewAfter:true, o implementador DEVE voltar após editar: escreva um relatório JSON UTF-8 com {"assignmentId":"<implementation.assignmentId>","summary":"o que mudou","files":["caminhos alterados"],"verification":"comandos e resultados","reviewRequest":"peça opiniões aos demais"}. Todos os campos são obrigatórios. Envie: ${report}. Depois siga next e continue /wait; não pare após implementar. Com reviewAfter:false, o relatório é opcional e você pode concluir.`,
-    `O relatório inicia phase:"review" com novas rodadas e votos, preservando o histórico. Inspecione os arquivos e testes alterados. Uma proposta reviewCompletion:true aprova a implementação; concorde com ela para encerrar após o texto final. Para pedir ajustes, envie ?propose=ID com um plano concreto. Só um novo plano adotado inicia outro ciclo de implementação e relatório. maxRounds limita cada fase de debate/revisão.`,
-    `Considere o moderador (from:"human") e o idioma da resposta. O moderador pode enviar mensagens em qualquer fase; elas não alteram next nem autorizam pular bloqueios. Sair do navegador não encerra o debate nem a escolha do implementador. Não peça ao humano para continuar enquanto next indicar /wait. Se a primeira conexão falhar, avise em uma linha; nas demais falhas repita /wait.`
+    `Enquanto next:"implement", o implementador pode enviar atualizações comuns por /say. Use ?to=ID para uma consulta intermediária e aguarde enquanto next for GET /wait. Para passar o trabalho a uma IA mais adequada, escreva JSON UTF-8 {"assignmentId":"<implementation.assignmentId>","to":"AGENT_ID","reason":"trabalho feito, arquivos, verificações, pendências e por que escolheu esta IA"} e envie ${transfer}. Só o implementador atual transfere; pare de editar após o sucesso. A destinatária assume imediatamente e deve usar o novo assignmentId.`,
+    `O implementador DEVE voltar após editar. Escreva JSON UTF-8 com {"assignmentId":"<implementation.assignmentId>","summary":"o que mudou","files":["caminhos alterados"],"verification":"comandos e resultados"${S.implementation.reviewAfter ? ',"reviewRequest":"peça opiniões aos demais"' : ''}} e envie ${report}. ${S.implementation.reviewAfter ? 'Depois siga next e continue em /wait para a revisão.' : 'O relatório aceito conclui o fluxo.'}`,
+    `O relatório inicia phase:"review" com nova discussão e votos, preservando o histórico. Inspecione os arquivos e testes alterados. Uma proposta reviewCompletion:true aprova a implementação; concorde com ela para encerrar após o texto final. Para pedir ajustes, envie ?propose=ID com um plano concreto. Só um novo plano adotado inicia outro ciclo de implementação e relatório.`,
+    `Considere mensagens do moderador (from:"human") e siga next quando uma delas pedir resposta. Somente o moderador humano usa /admin/*; nunca acesse a sessão do painel, chame rotas de moderador ou publique como human. Seu X-Token vale somente nas rotas de agente. Sair do navegador não encerra o fluxo. Se a primeira conexão falhar, avise uma vez; nas demais falhas repita /wait.`
   ]).join('\n\n');
 }
 
@@ -351,17 +375,19 @@ function handleImplementationReport(req, res, me) {
     const current = S.implementation, responsible = current.report?.agentId || current.agentId;
     if (responsible !== me) return fail(res, 403, me, { error: 'not_implementation_agent' });
     if (typeof input.assignmentId !== 'string' || input.assignmentId !== current.assignmentId) return fail(res, 409, me, { error: 'stale_implementation_assignment' });
-    if (['summary', 'verification', 'reviewRequest'].some(field => typeof input[field] !== 'string' || !input[field].trim()) || !Array.isArray(input.files) || !input.files.length || input.files.some(file => typeof file !== 'string' || !file.trim()))
-      return fail(res, 400, me, { error: 'invalid_implementation_report', required: ['assignmentId', 'summary', 'files', 'verification', 'reviewRequest'] });
-    const details = { assignmentId: input.assignmentId, summary: input.summary.trim(), files: [...new Set(input.files.map(file => file.trim()))], verification: input.verification.trim(), reviewRequest: input.reviewRequest.trim() };
+    const requiredText = current.reviewAfter ? ['summary', 'verification', 'reviewRequest'] : ['summary', 'verification'];
+    if (requiredText.some(field => typeof input[field] !== 'string' || !input[field].trim()) || !Array.isArray(input.files) || !input.files.length || input.files.some(file => typeof file !== 'string' || !file.trim()))
+      return fail(res, 400, me, { error: 'invalid_implementation_report', required: ['assignmentId', 'summary', 'files', 'verification', ...(current.reviewAfter ? ['reviewRequest'] : [])] });
+    const details = { assignmentId: input.assignmentId, summary: input.summary.trim(), files: [...new Set(input.files.map(file => file.trim()))], verification: input.verification.trim(), reviewRequest: typeof input.reviewRequest === 'string' ? input.reviewRequest.trim() : '' };
     if (current.report) {
       const identical = ['assignmentId', 'summary', 'verification', 'reviewRequest'].every(field => current.report[field] === details[field]) && JSON.stringify(current.report.files) === JSON.stringify(details.files);
       return identical ? send(res, 200, { ...view(me), report: current.report, duplicate: true }) : fail(res, 409, me, { error: 'implementation_report_already_submitted' });
     }
     if (S.phase !== 'implementation' || S.state !== 'closed' || current.status !== 'ready' || !hasFinalSolution()) return fail(res, 409, me, { error: 'implementation_not_ready' });
+    if (next(me) !== 'implement') return fail(res, 409, me, { error: 'implementation_action_pending', hint: 'conclua ou transfira a consulta pendente antes de enviar o relatório da implementação' });
     const since = lastOwn(me);
     const report = { ...details, agentId: me, ts: iso(), cycle: S.reviewCycle + (current.reviewAfter ? 1 : 0), planProposalId: S.agreedOn, messageId: null };
-    const text = localized(`Implementação concluída.\n\n${report.summary}\n\nArquivos alterados:\n${report.files.map(file => `- ${file}`).join('\n')}\n\nVerificação: ${report.verification}\n\n${report.reviewRequest}`, `Implementation completed.\n\n${report.summary}\n\nChanged files:\n${report.files.map(file => `- ${file}`).join('\n')}\n\nVerification: ${report.verification}\n\n${report.reviewRequest}`);
+    const text = localized(`Implementação concluída.\n\n${report.summary}\n\nArquivos alterados:\n${report.files.map(file => `- ${file}`).join('\n')}\n\nVerificação: ${report.verification}${report.reviewRequest ? `\n\n${report.reviewRequest}` : ''}`, `Implementation completed.\n\n${report.summary}\n\nChanged files:\n${report.files.map(file => `- ${file}`).join('\n')}\n\nVerification: ${report.verification}${report.reviewRequest ? `\n\n${report.reviewRequest}` : ''}`);
     if (current.reviewAfter) {
       S.phase = 'review'; S.state = 'open'; S.phaseStartId = (S.messages.at(-1)?.id || 0) + 1; S.reviewCycle++;
       S.turn = nextAfter(me); S.writer = null; S.agreedOn = null; S.forced = false; S.final = null;
@@ -372,6 +398,31 @@ function handleImplementationReport(req, res, me) {
     report.messageId = message.id;
     save(); wake();
     return send(res, 200, { ...view(me), report, id: message.id, messages: S.messages.filter(m => m.id > since && m.id < message.id).map(pub) });
+  } catch (e) { send(res, 500, { error: 'server_error', detail: String(e) }); } });
+}
+
+function handleImplementationTransfer(req, res, me) {
+  body(req, b => { try {
+    if (!debates.has(S.id)) return send(res, 410, { error: 'debate_deleted', state: 'closed', next: 'stop' });
+    if (agent(me)?.token !== req.headers['x-token']) return send(res, 401, { error: 'bad_token' });
+    if (b.length > LIMIT) return fail(res, 413, me, { error: 'too_large', max: LIMIT });
+    let input; try { input = JSON.parse(b.toString('utf8')); } catch { return fail(res, 400, me, { error: 'bad_json' }); }
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return fail(res, 400, me, { error: 'invalid_implementation_transfer' });
+    const current = S.implementation, reason = typeof input.reason === 'string' ? input.reason.trim() : '', target = agent(input.to);
+    if (current.transfer?.fromAssignmentId === input.assignmentId && current.transfer.from === me && current.transfer.to === input.to && current.transfer.reason === reason)
+      return send(res, 200, { ...view(me), transfer: current.transfer, id: current.transfer.messageId, duplicate: true });
+    if (typeof input.assignmentId !== 'string' || input.assignmentId !== current.assignmentId) return fail(res, 409, me, { error: 'stale_implementation_assignment' });
+    if (S.phase !== 'implementation' || S.state !== 'closed' || current.status !== 'ready' || current.report) return fail(res, 409, me, { error: 'implementation_not_ready' });
+    if (current.agentId !== me) return fail(res, 403, me, { error: 'not_implementation_agent' });
+    if (!target || target.id === me) return fail(res, 400, me, { error: 'invalid_transfer_agent', agents: ids().filter(id => id !== me) });
+    if (!reason || reason.length > 4000) return fail(res, 400, me, { error: 'invalid_transfer_reason', required: ['assignmentId', 'to', 'reason'] });
+    const since = lastOwn(me), pending = S.agents.filter(a => pendingImplementationMessageFor(a.id)).map(a => a.id), ts = iso(), fromAssignmentId = current.assignmentId, assignmentId = rnd(12);
+    const transfer = { fromAssignmentId, assignmentId, from: me, to: target.id, reason, ts, messageId: null };
+    current.agentId = target.id; current.assignedAt = ts; current.assignmentId = assignmentId; current.transfer = transfer;
+    const message = push(me, 'implementation_transfer', localized(`${nameOf(me)} transferiu a implementação para ${target.name}.\n\nMotivo: ${reason}`, `${nameOf(me)} transferred the implementation to ${target.name}.\n\nReason: ${reason}`), { to: target.id, implementationAssignmentId: assignmentId, implementationTransfer: transfer, skippedConsultations: pending });
+    transfer.messageId = message.id;
+    save(); wake();
+    return send(res, 200, { ...view(me), transfer, id: message.id, messages: S.messages.filter(m => m.id > since && m.id < message.id).map(pub) });
   } catch (e) { send(res, 500, { error: 'server_error', detail: String(e) }); } });
 }
 
@@ -390,7 +441,24 @@ function handleSay(req, res, me, q) {
     if (to && flag !== 'msg') return fail(res, 400, me, { error: 'to_only_with_plain_message', hint: '?to= so em mensagem sem outra flag' });
     if (!text && flag !== 'pass') return fail(res, 400, me, { error: 'empty_text', hint: `o corpo e o texto da mensagem: --data-binary "@.ai-debate/${me}.md"` });
     if (N() < 2) return fail(res, 409, me, { error: 'not_ready', hint: 'o moderador ainda nao criou 2 agentes; aguarde com GET /wait' });
-    if (S.state === 'closed') return fail(res, 410, me, { error: 'closed', hint: 'debate encerrado; siga next enquanto a implementação é definida' });
+    if (S.state === 'closed') {
+      if (S.phase !== 'implementation' || S.implementation.status !== 'ready') return fail(res, 410, me, { error: 'closed', hint: 'debate encerrado; siga next enquanto a implementação é definida' });
+      if (flag !== 'msg') return fail(res, 409, me, { error: 'implementation_plain_message_only', hint: 'durante a implementação envie apenas atualização ou consulta comum; o relatório final usa /implementation/report' });
+      if (to && (!agent(to) || to === me)) return fail(res, 400, me, { error: 'bad_to', agents: ids().filter(i => i !== me) });
+      const messages = implementationMessages(), previous = messages.findLast(m => m.from === me), latest = S.messages.at(-1);
+      if (previous && latest?.id === previous.id && previous.text === text && (previous.requestedTo || null) === (to || null)) return send(res, 200, { id: previous.id, duplicate: true, hint: 'mensagem intermediária idêntica já aceita', ...view(me) });
+      const pending = pendingImplementationMessageFor(me), waiting = pendingImplementationPeers();
+      if (!pending && me !== S.implementation.agentId) return fail(res, 409, me, { error: 'implementation_message_not_available', hint: 'aguarde uma consulta dirigida ou o início da revisão' });
+      if (!pending && waiting.length) return fail(res, 409, me, { error: 'implementation_consultation_pending', hint: 'aguarde a resposta da consulta atual com GET /wait' });
+      if (pending && to) return fail(res, 400, me, { error: 'no_chained_direct', hint: 'responda à consulta sem ?to' });
+      if (!pending && to && !S.implementation.reviewAfter) return fail(res, 409, me, { error: 'implementation_consultation_disabled', hint: 'ative a revisão após implementar para manter as outras IAs disponíveis para consulta' });
+      const since = lastOwn(me), extra = { implementationAssignmentId: S.implementation.assignmentId, requestedTo: to || null };
+      if (pending) { extra.replyTo = pending.id; extra.to = pending.from; }
+      else if (to) extra.to = to;
+      const m = push(me, pending ? 'implementation_reply' : 'implementation_update', text, extra);
+      save(); wake();
+      return send(res, 200, { id: m.id, ...view(me), messages: S.messages.filter(message => message.id > since && message.id < m.id).map(pub) });
+    }
     const lastA = phaseAgentMsgs().at(-1);
     if (turn() !== me) return fail(res, 409, me, { error: 'not_your_turn', turnName: nameOf(turn()), lastFrom: lastA ? lastA.from : null, hint: 'aguarde com GET /wait' + (lastA && lastA.from === me ? ' (lastFrom e voce: sua mensagem anterior ja entrou)' : '') });
     const p = proposal(), mine = phaseMessages().findLast(x => x.from === me), since = lastOwn(me);
@@ -405,12 +473,10 @@ function handleSay(req, res, me, q) {
       return send(res, 200, { id: mine.id, duplicate: true, hint: 'mensagem identica a sua ultima: nao foi gravada de novo; leia "messages" e responda ao que veio depois', ...view(me) });
     if (to && (!agent(to) || to === me)) return fail(res, 400, me, { error: 'bad_to', agents: ids().filter(i => i !== me) });
     if (to && lastA && lastA.to === me) return fail(res, 400, me, { error: 'no_chained_direct', hint: 'voce acabou de receber uma pergunta dirigida: responda sem ?to para a vez voltar ao rodizio' });
-    if (to && count() + 1 >= maxMessages()) return fail(res, 400, me, { error: 'no_direct_on_last_message', hint: 'esta e a ultima mensagem do debate: argumente, ?agree=N ou ?pass=1' });
     const extra = {};
     if (flag === 'propose') {
       const w = q.get('propose');
       if (!agent(w)) return fail(res, 400, me, { error: 'bad_propose', hint: '?propose=<id de quem implementa>', agents: ids() });
-      if (round() === S.maxRounds) return fail(res, 400, me, { error: 'last_round_no_propose', hint: 'na ultima rodada so cabe ?agree=N, argumentar ou ?pass=1' });
       extra.writer = w;
     }
     if (flag === 'agree') {
@@ -430,8 +496,7 @@ function handleSay(req, res, me, q) {
     if (S.agents.every(a => pos[a.id] === cur.id)) {
       S.state = 'agreed'; S.writer = cur.writer; S.agreedOn = cur.id; S.forced = false; S.turn = cur.writer;
       push('system', 'system', localized(`Acordo unânime na proposta #${cur.id}. ${nameOf(cur.writer)} escreve a solução final.`, `Unanimous agreement on proposal #${cur.id}. ${nameOf(cur.writer)} writes the final solution.`));
-    } else if (count() >= maxMessages()) decide(localized(`limite de ${S.maxRounds} rodadas`, `${S.maxRounds}-round limit`));
-    else S.turn = to || (lastA && lastA.to === me ? resumeAfter(lastA.from, me) : nextAfter(me));
+    } else S.turn = to || (lastA && lastA.to === me ? resumeAfter(lastA.from, me) : nextAfter(me));
     save(); wake();
     send(res, 200, { id: m.id, ...view(me), messages: S.messages.filter(x => x.id > since && x.id < m.id).map(pub) });
   } catch (e) { send(res, 500, { error: 'server_error', detail: String(e) }); } });
@@ -439,11 +504,10 @@ function handleSay(req, res, me, q) {
 
 const slug = s => (s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'agente').slice(0, 24);
 function admin(req, res, u) {
-  if (req.headers['x-admin'] !== APP.admin) return send(res, 401, { error: 'bad_admin', hint: `recarregue o painel em ${URL_} (a chave vai injetada na pagina)` });
   const parts = u.pathname.split('/').filter(Boolean);
   let previousTurn = turn(), previousDebateId = S.id;
   const done = () => { syncTurnStartedAt(previousTurn, previousDebateId); save(); wake(); send(res, 200, publicState()); };
-  if (req.method === 'GET' && parts[1] === 'settings') return send(res, 200, { languagePreference: APP.languagePreference, language: APP.language, waitSeconds: APP.waitSeconds, maxRounds: S.maxRounds, debateLanguage: S.language });
+  if (req.method === 'GET' && parts[1] === 'settings') return send(res, 200, { languagePreference: APP.languagePreference, language: APP.language, waitSeconds: APP.waitSeconds, debateLanguage: S.language });
   if (req.method === 'GET' && parts[1] === 'implementation') return send(res, 200, { ...S.implementation });
   if (req.method === 'GET' && parts[1] === 'agents') return send(res, 200, S.agents.map(a => ({ ...a, prompt: promptFor(a) })));
   if (req.method === 'GET' && parts[1] === 'debates') {
@@ -490,12 +554,12 @@ function admin(req, res, u) {
         const base = slug(name); let sid = base, k = 2; while (agent(sid) || sid === 'human' || sid === 'system') sid = `${base}-${k++}`;
         const kind = Object.hasOwn(KINDS, j.kind) ? j.kind : 'other';
         const roleDefault = !String(j.role || '').trim(), role = String(j.role || '').trim() || defaultRole(N());
-        S.agents.push({ id: sid, name, kind, role, roleDefault, color: KINDS[kind].color, token: `${sid}-${rnd(4)}`, confirmedAt: null });
+        S.agents.push({ id: sid, name, kind, role, roleDefault, color: KINDS[kind].color, token: `${sid}-${rnd(16)}`, confirmedAt: null });
         return done();
       }
       const a = agent(id); if (!a) return send(res, 404, { error: 'no_such_agent' });
-      if (req.method === 'DELETE') { if (started) return send(res, 409, { error: 'debate_started' }); S.agents = S.agents.filter(x => x !== a); if (S.turn === a.id) S.turn = null; if (S.implementation.agentId === a.id) { S.implementation.mode = 'choose'; S.implementation.agentId = null; resolveImplementation(); } return done(); }
-      if (req.method === 'POST' && parts[3] === 'token') { a.token = `${a.id}-${rnd(4)}`; if (!started) a.confirmedAt = null; return done(); }
+      if (req.method === 'DELETE') { if (started) return send(res, 409, { error: 'debate_started' }); S.agents = S.agents.filter(x => x !== a); if (S.turn === a.id) S.turn = null; if (S.implementation.agentId === a.id || S.implementation.configuredAgentId === a.id) { S.implementation.mode = 'choose'; S.implementation.configuredAgentId = null; S.implementation.agentId = null; resolveImplementation(); } return done(); }
+      if (req.method === 'POST' && parts[3] === 'token') { a.token = `${a.id}-${rnd(16)}`; if (!started) a.confirmedAt = null; return done(); }
       if (req.method === 'PUT') {
         if (typeof j.name === 'string' && j.name.trim()) a.name = j.name.trim();
         if (typeof j.role === 'string' && j.role.trim()) { a.role = j.role.trim(); a.roleDefault = false; }
@@ -509,13 +573,13 @@ function admin(req, res, u) {
       if (!implementationModes.includes(mode)) return send(res, 400, { error: 'invalid_implementation_mode' });
       if (j.unanimousOnly !== undefined && typeof j.unanimousOnly !== 'boolean') return send(res, 400, { error: 'invalid_unanimous_only' });
       if (j.reviewAfter !== undefined && typeof j.reviewAfter !== 'boolean') return send(res, 400, { error: 'invalid_review_after' });
-      const agentId = mode === 'agent' ? j.agentId === undefined ? current.agentId : j.agentId : null;
-      if (mode === 'agent' && !agent(agentId)) return send(res, 400, { error: 'invalid_implementation_agent' });
+      const configuredAgentId = mode === 'agent' ? j.agentId === undefined ? current.configuredAgentId : j.agentId : null;
+      if (mode === 'agent' && !agent(configuredAgentId)) return send(res, 400, { error: 'invalid_implementation_agent' });
       const unanimousOnly = j.unanimousOnly === undefined ? current.unanimousOnly : j.unanimousOnly;
       const reviewAfter = j.reviewAfter === undefined ? current.reviewAfter : j.reviewAfter;
       if (current.status === 'ready') return send(res, 409, { error: 'implementation_already_assigned' });
       if (current.status === 'completed') return send(res, 409, { error: 'implementation_completed' });
-      S.implementation = { ...current, mode, agentId, unanimousOnly, reviewAfter };
+      S.implementation = { ...current, mode, configuredAgentId, agentId: current.status === 'waiting' ? configuredAgentId : current.agentId, unanimousOnly, reviewAfter };
       resolveImplementation();
       return done();
     }
@@ -527,7 +591,7 @@ function admin(req, res, u) {
       if (S.implementation.unanimousOnly && S.forced) return send(res, 409, { error: 'implementation_requires_unanimity' });
       if (S.implementation.status === 'ready') return S.implementation.agentId === j.agentId ? done() : send(res, 409, { error: 'implementation_already_assigned' });
       S.phase = 'implementation';
-      S.implementation = { ...S.implementation, mode: 'choose', agentId: j.agentId, status: 'ready', reason: null, assignedAt: iso(), assignmentId: rnd(12), report: null, completedAt: null };
+      S.implementation = { ...S.implementation, mode: 'choose', configuredAgentId: null, agentId: j.agentId, status: 'ready', reason: null, assignedAt: iso(), assignmentId: rnd(12), transfer: null, report: null, completedAt: null };
       push('system', 'system', localized(`${nameOf(j.agentId)} foi escolhido para implementar a solução final.`, `${nameOf(j.agentId)} was selected to implement the final solution.`));
       return done();
     }
@@ -535,12 +599,6 @@ function admin(req, res, u) {
       if (j.languagePreference !== undefined && !['system', 'pt', 'en'].includes(j.languagePreference)) return send(res, 400, { error: 'invalid_language_preference' });
       if (j.language !== undefined && !['pt', 'en'].includes(j.language)) return send(res, 400, { error: 'invalid_language' });
       if (j.waitSeconds !== undefined && (!Number.isInteger(+j.waitSeconds) || +j.waitSeconds < 5 || +j.waitSeconds > 300)) return send(res, 400, { error: 'waitSeconds_5_300' });
-      if (j.maxRounds !== undefined) {
-        const r = +j.maxRounds; if (!Number.isInteger(r) || !(r >= 2 && r <= 50)) return send(res, 400, { error: 'maxRounds_2_50', hint: 'rodadas: use um valor entre 2 e 50' });
-        const cur = N() ? Math.floor(count() / N()) + 1 : 1;
-        if (S.state === 'open' && count() > 0 && r < cur) return send(res, 400, { error: 'maxRounds_below_current_round', hint: `ja estamos na rodada ${cur}; para encerrar use Forcar decisao` });
-        S.maxRounds = r;
-      }
       if (j.waitSeconds !== undefined) APP.waitSeconds = +j.waitSeconds;
       if (j.languagePreference !== undefined) APP.languagePreference = j.languagePreference;
       if (j.language !== undefined || (j.languagePreference !== undefined && j.languagePreference !== 'system')) {
@@ -553,11 +611,19 @@ function admin(req, res, u) {
     if (req.method === 'POST' && parts[1] === 'hint') {
       const text = String(j.text || '').trim(); if (!text) return send(res, 400, { error: 'empty_text' });
       const resolved = referencesFor(j.references, text); if (resolved.error) return send(res, 400, resolved);
-      push('human', 'hint', text, { ...(j.to && agent(j.to) ? { to: j.to } : {}), references: resolved.references }); save(); wake(); return send(res, 200, publicState());
+      const target = j.to && agent(j.to) ? j.to : null;
+      push('human', 'hint', text, { ...(target ? { to: target } : {}), references: resolved.references, ...(target && S.phase === 'implementation' && S.implementation.status === 'ready' ? { implementationAssignmentId: S.implementation.assignmentId } : {}) }); save(); wake(); return send(res, 200, publicState());
     }
     if (req.method === 'POST' && parts[1] === 'skip') {
       if (presence().waiting) return rejectWaiting(res);
-      if (S.state === 'closed' || N() < 2) return send(res, 409, { error: 'not_open' });
+      if (N() < 2) return send(res, 409, { error: 'not_open' });
+      if (S.state === 'closed') {
+        if (S.phase !== 'implementation' || S.implementation.status !== 'ready') return send(res, 409, { error: 'not_open' });
+        const pending = S.agents.filter(a => pendingImplementationMessageFor(a.id));
+        if (!pending.length) return send(res, 409, { error: 'no_pending_consultation' });
+        push('system', 'system', localized(`O moderador encerrou a consulta intermediária com ${new Intl.ListFormat('pt-BR', { style: 'long', type: 'conjunction' }).format(pending.map(a => a.name))}. A implementação pode continuar.`, `The moderator ended the intermediate consultation with ${new Intl.ListFormat('en', { style: 'long', type: 'conjunction' }).format(pending.map(a => a.name))}. Implementation can continue.`), { implementationAssignmentId: S.implementation.assignmentId, skippedConsultations: pending.map(a => a.id) });
+        return done();
+      }
       if (S.state === 'agreed') {
         const from = S.writer; S.writer = S.turn = nextAfter(from);
         push('system', 'system', localized(`Moderador passou a escrita do texto final de ${nameOf(from)} para ${nameOf(S.writer)}.`, `Moderator reassigned the final solution from ${nameOf(from)} to ${nameOf(S.writer)}.`)); return done();
@@ -566,10 +632,10 @@ function admin(req, res, u) {
       S.turn = last && last.to === from ? resumeAfter(last.from, from) : nextAfter(from);
       push('system', 'system', localized(`Moderador passou a vez de ${nameOf(from)} para ${nameOf(S.turn)}.`, `Moderator passed the turn from ${nameOf(from)} to ${nameOf(S.turn)}.`)); return done();
     }
-    if (req.method === 'POST' && parts[1] === 'decide') {
+    if (req.method === 'POST' && parts[1] === 'decision-request') {
       if (presence().waiting) return rejectWaiting(res);
       if (S.state !== 'open') return send(res, 409, { error: 'not_open' });
-      if (!decide(localized('moderador encerrou o debate', 'moderator ended the debate'))) return send(res, 409, { error: 'no_proposal', hint: 'ainda nao ha proposta para adotar' });
+      push('human', 'decision_request', localized('O moderador pediu uma decisão. Revisem a proposta atual e as divergências pendentes, façam as análises necessárias e busquem um acordo explícito agora. Apoiem a proposta mais recente somente se ela estiver pronta; caso contrário, proponham a alteração necessária. O debate continua na vez atual.', 'The moderator requested a decision. Review the current proposal and pending disagreements, complete the necessary analysis, and seek an explicit agreement now. Support the latest proposal only if it is ready; otherwise, propose the required change. The debate continues with the current turn.'));
       return done();
     }
     if (req.method === 'POST' && parts[1] === 'close') {
@@ -592,14 +658,23 @@ const srv = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x'), q = u.searchParams;
   if (req.method === 'GET' && u.pathname === '/') {
     try {
-      let html = fs.readFileSync(P('panel.html'), 'utf8');
-      const tag = `<script>window.__ADMIN_KEY__=${JSON.stringify(APP.admin)}</script>`;
-      html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, m => m + tag) : tag + html;
+      const pair = q.get('pair');
+      if (pair !== null) {
+        if (req.headers['x-token'] || !safeEqual(pair, moderatorBootstrap)) return send(res, 403, { error: 'invalid_moderator_pairing' });
+        issueModeratorSession(res); rotateModeratorBootstrap(); res.writeHead(303, { Location: '/' }); return res.end();
+      }
+      if (!hasModeratorSession(req)) {
+        const pt = String(req.headers['accept-language'] || '').toLowerCase().startsWith('pt');
+        const title = pt ? 'Acesso do moderador' : 'Moderator access', message = pt ? 'Abra a URL privada exibida no terminal do servidor para autorizar este navegador.' : 'Open the private URL shown in the server terminal to authorize this browser.';
+        const html = `<!doctype html><html lang="${pt ? 'pt-BR' : 'en'}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#080b11"><title>${title}</title><link rel="icon" type="image/png" href="/logos/app.png"><style>*{box-sizing:border-box}body{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 0,#132441,#080b11 58%);color:#e6eef8;font:14px system-ui,sans-serif}.card{width:min(480px,100%);padding:32px;border:1px solid #2b3b50;border-radius:18px;background:#101925;box-shadow:0 24px 90px #0008}.mark{display:grid;place-items:center;width:44px;height:44px;margin-bottom:22px;border:1px solid #3f5f91;border-radius:13px;background:#172942}.mark img{width:32px;height:32px;object-fit:contain}h1{margin:0 0 12px;font-size:22px}p{margin:0;color:#91a6c1;line-height:1.8}</style></head><body><main class="card"><div class="mark"><img src="/logos/app.png" alt=""></div><h1>${title}</h1><p>${message}</p></main></body></html>`;
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(html);
+      }
+      const html = fs.readFileSync(P('panel.html'), 'utf8');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(html);
     } catch { return send(res, 500, { error: 'panel_missing', hint: 'panel.html precisa estar ao lado do server.js' }); }
   }
   if (req.method === 'GET' && u.pathname === '/events') {
-    if (q.get('key') !== APP.admin && req.headers['x-admin'] !== APP.admin) return send(res, 401, { error: 'bad_admin' });
+    if (!hasModeratorSession(req)) return send(res, 401, { error: 'bad_admin' });
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.write(`event: ready\ndata: ${JSON.stringify({ activeId: APP.activeId })}\n\n`);
     subscribers.add(res);
@@ -618,11 +693,12 @@ const srv = http.createServer((req, res) => {
     catch { return send(res, 404, { error: 'no_logo' }); }
   }
   if (u.pathname.startsWith('/admin/') || (req.method === 'GET' && u.pathname === '/state')) {
+    if (!hasModeratorSession(req)) return send(res, req.headers['x-token'] ? 403 : 401, { error: req.headers['x-token'] ? 'agent_cannot_admin' : 'bad_admin', hint: `recarregue o painel em ${URL_}` });
     const d = getDebate(q.get('debate') || APP.activeId);
     if (!d) return send(res, 404, { error: 'no_such_debate' });
     return withDebate(d, () => u.pathname === '/state' ? send(res, 200, publicState()) : admin(req, res, u));
   }
-  if (u.pathname === '/wait' || u.pathname === '/say' || u.pathname === '/topic' || u.pathname === '/ready' || u.pathname === '/implementation/report') {
+  if (u.pathname === '/wait' || u.pathname === '/say' || u.pathname === '/topic' || u.pathname === '/ready' || u.pathname === '/implementation/report' || u.pathname === '/implementation/transfer') {
     const tok = req.headers['x-token'], d = debateForToken(tok);
     if (!d) return send(res, 401, { error: 'bad_token', hint: 'header X-Token: <agent token>' });
     const me = d.agents.find(a => a.token === tok).id;
@@ -632,12 +708,13 @@ const srv = http.createServer((req, res) => {
       if (req.method === 'POST' && u.pathname === '/say') return handleSay(req, res, me, q);
       if (req.method === 'POST' && u.pathname === '/ready') return handleReady(req, res, me);
       if (req.method === 'POST' && u.pathname === '/implementation/report') return handleImplementationReport(req, res, me);
+      if (req.method === 'POST' && u.pathname === '/implementation/transfer') return handleImplementationTransfer(req, res, me);
       send(res, 405, { error: 'method_not_allowed' });
     });
   }
-  send(res, 404, { error: 'not_found', endpoints: ['GET /topic', 'POST /ready', 'GET /wait[?timeout=S]', 'POST /say[?propose=ID|?agree=N|?to=ID|?pass=1|?final=1]', 'POST /implementation/report'] });
+  send(res, 404, { error: 'not_found', endpoints: ['GET /topic', 'POST /ready', 'GET /wait[?timeout=S]', 'POST /say[?propose=ID|?agree=N|?to=ID|?pass=1|?final=1]', 'POST /implementation/report', 'POST /implementation/transfer'] });
 });
 srv.on('error', e => { console.error(e.code === 'EADDRINUSE' ? `porta ${PORT} ocupada: netstat -ano | findstr :${PORT}` : e); process.exit(1); });
 process.on('uncaughtException', e => console.error('erro nao tratado:', e));
 save(); if (dirty) { console.error('nao consegui gravar em data/ nesta pasta; verifique permissoes'); process.exit(1); }
-srv.listen(PORT, '127.0.0.1', () => console.log(`ai-debate no ar.\n  Abra o painel:  ${URL_}\n  debate=${S.id} "${S.title}" state=${S.state} agentes=${N()} turno=${turn() || '-'}\n  debates salvos=${debateIds().length}`));
+srv.listen(PORT, '127.0.0.1', () => console.log(`ai-debate no ar.\n  Acesso do moderador: ${URL_}/?pair=${moderatorBootstrap}\n  debate=${S.id} "${S.title}" state=${S.state} agentes=${N()} turno=${turn() || '-'}\n  debates salvos=${debateIds().length}`));
